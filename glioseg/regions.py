@@ -17,10 +17,11 @@ mattering once both are remapped to canonical integers.
 from __future__ import annotations
 
 import numpy as np
-import torch
-from monai.transforms import MapTransform
 
 from .datasets import REGIONS, REGISTRY
+
+# torch and monai are imported LAZILY below. Tier-0 verification needs only
+# numpy + nibabel, so a broken or missing MONAI must not block it.
 
 
 def to_canonical(seg: np.ndarray, dataset: str) -> np.ndarray:
@@ -44,9 +45,10 @@ def to_regions(canon: np.ndarray, include_rc: bool = False) -> np.ndarray:
     return np.stack(chans).astype(np.uint8)
 
 
-def regions_from_logits(logits: torch.Tensor, thresh: float = 0.5) -> torch.Tensor:
+def regions_from_logits(logits, thresh: float = 0.5):
     """(B,C,...) logits -> binary channels. Threshold, never argmax."""
-    return (torch.sigmoid(logits) > thresh)
+    import torch
+    return torch.sigmoid(logits) > thresh
 
 
 def regions_to_labelmap(region_bin: np.ndarray) -> np.ndarray:
@@ -65,27 +67,37 @@ def regions_to_labelmap(region_bin: np.ndarray) -> np.ndarray:
     return out
 
 
-class ToCanonicalRegionsd(MapTransform):
-    """MONAI transform: load native seg -> canonical -> nested sigmoid channels.
+def _make_transform_class():
+    """Build the MONAI transform only when asked, so importing this module
+    never requires MONAI."""
+    from monai.transforms import MapTransform
 
-    Output has shape (C, H, W, D) with C = 3 (or 4 with RC).
-    """
+    class _ToCanonicalRegionsd(MapTransform):
+        """Load native seg -> canonical integers -> nested sigmoid channels.
+        Output shape (C, H, W, D) with C = 3, or 4 when include_rc."""
 
-    def __init__(self, keys, dataset: str, include_rc: bool = False,
-                 allow_missing_keys: bool = False):
-        super().__init__(keys, allow_missing_keys)
-        self.dataset = dataset
-        self.include_rc = include_rc
+        def __init__(self, keys, dataset: str, include_rc: bool = False,
+                     allow_missing_keys: bool = False):
+            super().__init__(keys, allow_missing_keys)
+            self.dataset = dataset
+            self.include_rc = include_rc
 
-    def __call__(self, data):
-        d = dict(data)
-        for k in self.key_iterator(d):
-            arr = np.asarray(d[k])
-            if arr.ndim == 4 and arr.shape[0] == 1:      # drop channel dim if present
-                arr = arr[0]
-            canon = to_canonical(arr, self.dataset)
-            d[k] = to_regions(canon, self.include_rc)
-        return d
+        def __call__(self, data):
+            d = dict(data)
+            for k in self.key_iterator(d):
+                arr = np.asarray(d[k])
+                if arr.ndim == 4 and arr.shape[0] == 1:   # drop channel dim
+                    arr = arr[0]
+                d[k] = to_regions(to_canonical(arr, self.dataset), self.include_rc)
+            return d
+
+    return _ToCanonicalRegionsd
+
+
+def ToCanonicalRegionsd(keys, dataset: str, include_rc: bool = False,
+                        allow_missing_keys: bool = False):
+    """Factory with the same call signature as a MONAI transform class."""
+    return _make_transform_class()(keys, dataset, include_rc, allow_missing_keys)
 
 
 def assert_nesting(region_bin: np.ndarray, name: str = "") -> None:
