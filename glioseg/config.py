@@ -16,7 +16,7 @@ ModelName = Literal["unet3d", "segresnet", "segformer3d", "swinunetr", "mednext"
 LossName = Literal["dice_bce", "dice_focal", "dice"]
 
 # Drive layout, verified 2026-09-02
-DRIVE_BASE = "/content/drive/MyDrive/Colab Notebooks/499a"
+DRIVE_BASE = "/content/drive/MyDrive/Colab Notebooks/499A"
 LOCAL_BASE = "/content/data"
 
 
