@@ -1,0 +1,12 @@
+# Pinned: SwinUNETR's img_size arg was REMOVED in MONAI 1.5 and required before
+# it, so 1.4.x is the only version where models.build_model works unpatched.
+monai==1.4.0
+torch>=2.0
+nibabel>=5.0
+einops>=0.7          # required by MONAI SwinUNETR
+numpy>=1.24
+scipy>=1.10          # connected components, Wilcoxon
+scikit-image>=0.21   # fallback for connected components
+matplotlib>=3.7      # XAI figures
+pandas>=2.0          # results tables in notebooks
+tqdm
