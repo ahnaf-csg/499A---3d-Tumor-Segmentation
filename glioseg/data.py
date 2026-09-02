@@ -13,7 +13,9 @@ from pathlib import Path
 
 import numpy as np
 from monai import transforms as T
+import torch
 from monai.data import DataLoader, Dataset, PersistentDataset
+from monai.data.utils import list_data_collate
 
 from .config import Config
 from .datasets import REGISTRY, find_cases
@@ -96,6 +98,11 @@ def build_transforms(cfg: Config, train: bool):
         # label is now (1,H,W,D) RAS -> expand to (C,H,W,D) nested channels
         ToCanonicalRegionsd(keys=["label"], dataset=cfg.dataset,
                             include_rc=cfg.include_rc),
+        # Re-assert types AFTER the custom transform. Belt and braces: whatever
+        # the transform or the PersistentDataset pickle boundary does, the
+        # deterministic prefix must end in tensors or the default collate fails
+        # with "'numpy.ndarray' object has no attribute 'numel'".
+        T.EnsureTyped(keys=keys, track_meta=True),
         T.CropForegroundd(keys=keys, source_key="image", allow_smaller=True),
         T.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     ]
@@ -115,6 +122,28 @@ def build_transforms(cfg: Config, train: bool):
         T.RandScaleIntensityd(keys="image", factors=0.1, prob=0.3),
         T.RandShiftIntensityd(keys="image", offsets=0.1, prob=0.3),
     ])
+
+
+def safe_collate(batch):
+    """MONAI's collate, but numpy arrays are coerced to tensors first.
+
+    The default collate calls .numel() on every element, so a single numpy array
+    anywhere in the batch raises. Rather than depend on every transform and the
+    PersistentDataset pickle round-trip preserving tensor types, coerce here --
+    this is the one place that cannot be bypassed.
+    """
+    import numpy as _np
+
+    def coerce(x):
+        if isinstance(x, _np.ndarray):
+            return torch.from_numpy(_np.ascontiguousarray(x))
+        if isinstance(x, dict):
+            return {k: coerce(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return type(x)(coerce(v) for v in x)
+        return x
+
+    return list_data_collate(coerce(batch))
 
 
 def _ds(records, tf, cfg: Config, tag: str):
@@ -151,9 +180,12 @@ def build_loaders(cfg: Config, split_path: str | Path | None = None,
 
     return (
         DataLoader(tr, batch_size=cfg.batch_size, shuffle=True, num_workers=2,
-                   pin_memory=True, drop_last=True, persistent_workers=False),
-        DataLoader(va, batch_size=1, shuffle=False, num_workers=2, pin_memory=True),
-        DataLoader(te, batch_size=1, shuffle=False, num_workers=2, pin_memory=True),
+                   pin_memory=True, drop_last=True, persistent_workers=False,
+                   collate_fn=safe_collate),
+        DataLoader(va, batch_size=1, shuffle=False, num_workers=2, pin_memory=True,
+                   collate_fn=safe_collate),
+        DataLoader(te, batch_size=1, shuffle=False, num_workers=2, pin_memory=True,
+                   collate_fn=safe_collate),
         {"split": split, "n_cases": len(cases),
          "counts": {k: len(v) for k, v in parts.items()}},
     )
