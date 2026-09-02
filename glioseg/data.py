@@ -60,21 +60,32 @@ def apply_split(cases: list[dict], split: dict) -> dict[str, list[dict]]:
     return out
 
 
-def subsample(cases: list[dict], n: int | None, seed: int) -> list[dict]:
-    """Take n cases, chosen at SUBJECT granularity so timepoints stay together.
-    This is the Tier-3 data-efficiency knob."""
-    if n is None or n >= len(cases):
-        return cases
-    subs = sorted({c["subject"] for c in cases})
-    rng = np.random.default_rng(seed)
+def subsample_train(parts: dict[str, list[dict]], n: int | None,
+                    seed: int) -> dict[str, list[dict]]:
+    """Limit the TRAIN split to n cases. Val and test are left untouched.
+
+    This is the Tier-3 data-efficiency knob, and holding val/test fixed is what
+    makes it a valid experiment: vary training size, measure on an unchanged
+    evaluation set. Changing both at once measures nothing.
+
+    Subsampling happens AFTER the split, never before. Doing it before is a trap
+    -- subsample() and make_split() both shuffle with default_rng(seed), so with
+    the same seed they produce the same order and the first n subjects are
+    exactly the ones assigned to train, leaving val and test EMPTY.
+    """
+    if n is None or n >= len(parts["train"]):
+        return parts
+    subs = sorted({c["subject"] for c in parts["train"]})
+    # offset the seed so this shuffle cannot coincide with make_split's
+    rng = np.random.default_rng(seed + 9973)
     rng.shuffle(subs)
     keep, out = set(), []
-    for s in subs:
-        keep.add(s)
-        out = [c for c in cases if c["subject"] in keep]
+    for sub in subs:
+        keep.add(sub)
+        out = [c for c in parts["train"] if c["subject"] in keep]
         if len(out) >= n:
             break
-    return out[:n]
+    return {**parts, "train": out[:n]}
 
 
 # --------------------------------------------------------------------------- #
@@ -174,8 +185,7 @@ def build_loaders(cfg: Config, split_path: str | Path | None = None,
     spec = REGISTRY[cfg.dataset]
     cases = find_cases(spec, cfg.data_base, modalities=cfg.modalities,
                        verbose=verbose)
-    cases = subsample(cases, cfg.n_cases, cfg.seed)
-
+    # NOTE: split FIRST on the full set, subsample the train split AFTER.
     if split_path and Path(split_path).exists():
         split = load_split(split_path)
     else:
@@ -184,6 +194,14 @@ def build_loaders(cfg: Config, split_path: str | Path | None = None,
             save_split(split, split_path)
 
     parts = apply_split(cases, split)
+    parts = subsample_train(parts, cfg.n_cases, cfg.seed)
+
+    for k in ("train", "val", "test"):
+        if not parts[k]:
+            raise RuntimeError(
+                f"{k} split is EMPTY. Training without validation or test data "
+                f"produces NaN metrics. Check n_cases ({cfg.n_cases}) against the "
+                f"split file, and delete a stale split if the case set changed.")
     if verbose:
         print(f"[split] subjects {{{', '.join(f'{k}:{len(v)}' for k,v in split.items())}}}"
               f"  cases {{{', '.join(f'{k}:{len(v)}' for k,v in parts.items())}}}")
