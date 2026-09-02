@@ -146,9 +146,23 @@ def safe_collate(batch):
     return list_data_collate(coerce(batch))
 
 
+# Measured on BraTS 2021: a cached item is ~170 MB (4x240x240x155 float32 image
+# plus a 3-channel label; CropForegroundd barely shrinks these volumes). So
+# PersistentDataset costs roughly 170 MB x n_cases of local disk -- ~149 GB for
+# 875 training cases, which exceeds a Colab VM. Cache only for small subsets.
+CACHE_MB_PER_CASE = 170
+
+
 def _ds(records, tf, cfg: Config, tag: str):
+    if cfg.cache_dir and tag == "train":
+        est_gb = len(records) * CACHE_MB_PER_CASE / 1024
+        if est_gb > 40:
+            print(f"  [cache] WARNING: ~{est_gb:.0f} GB needed for {len(records)} "
+                  f"cases. Colab has ~200 GB total. Set cache_dir=None or reduce "
+                  f"n_cases.")
     if cfg.cache_dir:
-        d = Path(cfg.cache_dir) / f"{cfg.dataset}_{tag}_{cfg.hash()}"
+        # data_hash, NOT hash -- so every arm shares one cache. See Config.data_hash.
+        d = Path(cfg.cache_dir) / f"{cfg.dataset}_{tag}_{cfg.data_hash()}"
         d.mkdir(parents=True, exist_ok=True)
         return PersistentDataset(data=records, transform=tf, cache_dir=str(d))
     return Dataset(data=records, transform=tf)
@@ -179,12 +193,12 @@ def build_loaders(cfg: Config, split_path: str | Path | None = None,
     te = _ds(parts["test"], build_transforms(cfg, False), cfg, "test")
 
     return (
-        DataLoader(tr, batch_size=cfg.batch_size, shuffle=True, num_workers=2,
+        DataLoader(tr, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
                    pin_memory=True, drop_last=True, persistent_workers=False,
                    collate_fn=safe_collate),
-        DataLoader(va, batch_size=1, shuffle=False, num_workers=2, pin_memory=True,
+        DataLoader(va, batch_size=1, shuffle=False, num_workers=cfg.num_workers, pin_memory=True,
                    collate_fn=safe_collate),
-        DataLoader(te, batch_size=1, shuffle=False, num_workers=2, pin_memory=True,
+        DataLoader(te, batch_size=1, shuffle=False, num_workers=cfg.num_workers, pin_memory=True,
                    collate_fn=safe_collate),
         {"split": split, "n_cases": len(cases),
          "counts": {k: len(v) for k, v in parts.items()}},
