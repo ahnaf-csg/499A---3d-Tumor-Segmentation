@@ -42,6 +42,11 @@ REGION_NAMES = list(REGIONS)
 # silently invalidates every transfer result while training without error.
 CANONICAL_MODALITY_ORDER = ("t1c", "t1n", "t2w", "t2f")
 
+# Only ZERO-byte files are unambiguously broken. A size threshold is the wrong
+# mechanism -- legitimately small volumes exist -- so truncation is detected by
+# reading the NIfTI header instead (see verify.check_integrity).
+MIN_FILE_BYTES = 1
+
 
 @dataclass
 class DatasetSpec:
@@ -100,9 +105,37 @@ def resolve_root(spec: DatasetSpec, base: str | Path) -> Path:
     return Path(base) / spec.root
 
 
+EXCLUDE_FILENAME = "excluded_cases.json"
+
+
+def load_exclusions(spec: DatasetSpec, base: str | Path) -> set[str]:
+    """Read the exclusion list Tier-0 wrote, if any.
+
+    This is the handoff between verification and training: verify.check_integrity
+    detects broken cases (0-byte AND truncated) and persists their names here, so
+    every later loader skips them without needing to re-scan.
+    """
+    import json
+    p = resolve_root(spec, base) / EXCLUDE_FILENAME
+    if not p.exists():
+        return set()
+    try:
+        return set(json.loads(p.read_text()).get("cases", []))
+    except Exception:
+        return set()
+
+
+def save_exclusions(spec: DatasetSpec, base: str | Path, cases: list[str]) -> Path:
+    import json
+    p = resolve_root(spec, base) / EXCLUDE_FILENAME
+    p.write_text(json.dumps({"dataset": spec.name, "cases": sorted(cases)}, indent=2))
+    return p
+
+
 def find_cases(spec: DatasetSpec, base: str | Path,
                modalities: Sequence[str] = CANONICAL_MODALITY_ORDER,
-               require_seg: bool = True, verbose: bool = True) -> list[dict]:
+               require_seg: bool = True, verbose: bool = True,
+               exclude: set[str] | None = None) -> list[dict]:
     """Discover cases. Never assumes ID ranges or contiguous numbering.
 
     Returns [{"case", "subject", "image": [paths in `modalities` order], "label"}].
@@ -116,9 +149,20 @@ def find_cases(spec: DatasetSpec, base: str | Path,
     # a case directory is one that directly contains NIfTI files
     case_dirs = sorted({p.parent for p in root.rglob("*.nii*")})
     cases, skipped = [], {}
+    excluded = set(exclude) if exclude is not None else load_exclusions(spec, base)
 
+    # Zero-byte and truncated files DO occur -- a real BraTS 2021 case shipped a
+    # 0-byte seg, and interrupted Drive copies truncate silently. Both raise deep
+    # inside nibabel mid-training, so exclude them at discovery instead.
     for d in case_dirs:
+        if d.name in excluded or (spec.case_depth == 2 and d.parent.name in excluded):
+            skipped[d.name] = "on Tier-0 exclusion list"
+            continue
         files = sorted(p for p in d.iterdir() if p.name.endswith((".nii", ".nii.gz")))
+        bad = [p.name for p in files if p.stat().st_size < MIN_FILE_BYTES]  # 0-byte
+        if bad:
+            skipped[d.name] = f"empty/truncated {bad}"
+            continue
         names = {p.name: p for p in files}
 
         imgs, missing = [], []
@@ -152,6 +196,8 @@ def find_cases(spec: DatasetSpec, base: str | Path,
     if verbose:
         print(f"[find_cases:{spec.name}] {root}")
         print(f"  usable cases : {len(cases)}")
+        if excluded:
+            print(f"  excluded     : {len(excluded)} case(s) from {EXCLUDE_FILENAME}")
         print(f"  subjects     : {len({c['subject'] for c in cases})}")
         if skipped:
             print(f"  SKIPPED {len(skipped)}: {dict(list(skipped.items())[:5])}"
