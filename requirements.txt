@@ -1,12 +1,23 @@
-# Pinned: SwinUNETR's img_size arg was REMOVED in MONAI 1.5 and required before
-# it, so 1.4.x is the only version where models.build_model works unpatched.
-monai==1.4.0
-torch>=2.0
+# DO NOT PIN numpy, torch, scipy or scikit-image on Colab.
+# Reinstalling them triggers source builds and can leave numpy's compiled
+# binaries mismatched with its Python files ("numpy.dtype size changed").
+# Colab ships all four. Install only the pure-Python additions below.
+#
+#   pip install monai --no-deps
+#   pip install einops nibabel
+#
+# The MONAI version is NOT pinned: models.build_model tries both SwinUNETR
+# signatures, so it works whether img_size is required (<=1.2), deprecated
+# (1.3-1.4) or removed (>=1.5). Validated on 1.6.0.
+
+monai>=1.3
+einops>=0.7
 nibabel>=5.0
-einops>=0.7          # required by MONAI SwinUNETR
-numpy>=1.24
-scipy>=1.10          # connected components, Wilcoxon
-scikit-image>=0.21   # fallback for connected components
-matplotlib>=3.7      # XAI figures
-pandas>=2.0          # results tables in notebooks
-tqdm
+
+# Already present in Colab -- listed for non-Colab installs only:
+# torch>=2.3          (torch.amp.GradScaler signature)
+# numpy>=1.24
+# scipy>=1.10         (connected components, Wilcoxon)
+# scikit-image>=0.21  (connected-components fallback)
+# matplotlib>=3.7     (XAI figures)
+# pandas>=2.0
