@@ -63,11 +63,16 @@ def build_model(cfg: Config) -> nn.Module:
         common = dict(in_channels=cin, out_channels=cout,
                       feature_size=kw.pop("feature_size", 48),
                       use_checkpoint=kw.pop("use_checkpoint", True))
-        # MONAI deprecated img_size in 1.3 and REMOVED it in 1.5, while earlier
-        # versions require it. Try both so the code survives either pin.
+        # MONAI history: img_size was REQUIRED (<=1.2), deprecated (1.3-1.4),
+        # then REMOVED (>=1.5). Omitting it raises TypeError on old versions;
+        # passing it raises DeprecatedError on new ones. So try without first
+        # and fall back -- this makes the code version-agnostic and means the
+        # MONAI pin in requirements.txt is belt-and-braces, not a hard need.
         try:
             return SwinUNETR(**common, **kw)
-        except TypeError:
+        except Exception as e:
+            if not isinstance(e, TypeError):
+                raise
             return SwinUNETR(img_size=cfg.patch_size, **common, **kw)
 
     if cfg.model == "mednext":
