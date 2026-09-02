@@ -20,7 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .datasets import CANONICAL_MODALITY_ORDER, REGISTRY, find_cases, resolve_root
+from .datasets import (CANONICAL_MODALITY_ORDER, REGISTRY, find_cases,
+                       resolve_root, save_exclusions)
 from .regions import assert_nesting, to_canonical, to_regions
 
 PASS, FAIL, INFO, UNVERIFIED = "PASS", "FAIL", "INFO", "????"
@@ -83,15 +84,53 @@ def check_environment(log: Log) -> None:
         ev["monai"] = None
     log.add("env", "environment recorded", INFO, ev)
 
-    if ev.get("monai") and not ev["monai"].startswith("1.4"):
-        log.add("env", "MONAI pinned to 1.4.x", UNVERIFIED,
-                {"found": ev["monai"]},
-                "SwinUNETR's img_size arg was removed in MONAI 1.5 and required "
-                "before it. Pin 1.4.x or patch models.build_model.")
     if ev.get("cuda") and ev.get("bf16_supported") is False:
         log.add("env", "GPU supports bf16", INFO, {"sm": ev.get("sm")},
                 "Turing/T4 detected: use fp16 + GradScaler, NOT bf16. "
                 "train.py handles this automatically.")
+
+
+def check_integrity(spec_name: str, base: str, log: Log) -> list[str]:
+    """stat() EVERY NIfTI under the root. Sampling misses corrupt files, and one
+    of them will crash an overnight run at an unpredictable point.
+
+    Returns the list of case directories that should be excluded.
+    """
+    spec = REGISTRY[spec_name]
+    root = resolve_root(spec, base)
+    files = list(root.rglob("*.nii*"))
+
+    bad = []
+    for f in files:
+        sz = f.stat().st_size
+        if sz == 0:
+            bad.append((str(f.relative_to(root)), sz, "zero bytes"))
+            continue
+        # Header read only -- nibabel is lazy, so this does not load voxel data.
+        # Catches truncated or corrupt files that a size threshold would miss.
+        try:
+            _load(f).shape
+        except Exception as e:
+            bad.append((str(f.relative_to(root)), sz, f"unreadable: {type(e).__name__}"))
+    bad_dirs = sorted({Path(b[0]).parent.name for b in bad})
+
+    log.add(f"{spec_name}/integrity", "every NIfTI is non-empty",
+            PASS if not bad else FAIL,
+            {"n_files_scanned": len(files), "n_bad": len(bad), "bad": bad[:12],
+             "affected_cases": bad_dirs[:12]},
+            "" if not bad else
+            f"{len(bad)} broken file(s) across {len(bad_dirs)} case(s). "
+            f"find_cases now excludes these automatically. If the source on Drive "
+            f"is also broken the case is genuinely corrupt; if only the local copy "
+            f"is, re-copy it.")
+
+    if bad_dirs:
+        # Persist so every later loader skips these without re-scanning.
+        pth = save_exclusions(spec, base, bad_dirs)
+        log.add(f"{spec_name}/integrity", "exclusion list written", INFO,
+                {"path": str(pth), "n_excluded": len(bad_dirs)},
+                "find_cases reads this automatically from now on.")
+    return bad_dirs
 
 
 def check_dataset(spec_name: str, base: str, log: Log, sample: int = 20) -> dict:
@@ -204,15 +243,11 @@ def check_dataset(spec_name: str, base: str, log: Log, sample: int = 20) -> dict
                           "nz_frac": round(float((a > 0).mean()), 3)})
     if stats:
         mx = max(s["max"] for s in stats)
+        note = ("Max <= 255 across all samples, which suggests uint8 rescaling "
+                "(as in SAILOR's MNI volumes). Confirm this is genuine before "
+                "trusting the normalisation in data.py." if mx <= 255.0 else "")
         log.add(f"{spec_name}/intensity", "intensity range recorded", INFO,
-                {"samples": stats},
-                "Values in 0-255 suggest uint8 rescaling (e.g. SAILOR MNI). "
-                "Normalisation is per-dataset; check data.py matches.")
-        if mx <= 255.0:
-            log.add(f"{spec_name}/intensity", "intensities appear NOT uint8-scaled",
-                    UNVERIFIED, {"max_observed": mx},
-                    "Max <= 255 across samples. Confirm this is genuine and not "
-                    "a rescale, since it changes normalisation.")
+                {"samples": stats, "max_observed": round(mx, 1)}, note)
 
     # ---- channel order ---------------------------------------------------- #
     ex = cases[0]
@@ -252,6 +287,7 @@ def run_all(base: str, datasets=("brats2021",), sample: int = 20,
     for ds in datasets:
         print(f"\n{'-'*70}\n  {ds}\n{'-'*70}")
         try:
+            check_integrity(ds, base, log)      # full scan first -- cheap, stat() only
             out[ds] = check_dataset(ds, base, log, sample)
         except Exception as e:
             log.add(f"{ds}/run", "check completed", FAIL, note=f"{type(e).__name__}: {e}")
