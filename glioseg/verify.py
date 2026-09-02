@@ -194,10 +194,16 @@ def check_dataset(spec_name: str, base: str, log: Log, sample: int = 20) -> dict
             f"UNEXPECTED {sorted(unexpected)} -- update label_map in datasets.py "
             f"before training, or every region will be wrong.")
 
-    log.add(f"{spec_name}/labels", "single consistent scheme across sample",
-            PASS if len(schemes) == 1 else FAIL,
-            {"n_schemes": len(schemes)},
-            "" if len(schemes) == 1 else "Mixed schemes: remap per subset, not globally.")
+    # Which SUBSET of labels appears varies legitimately -- not every tumour has
+    # a necrotic core, so {0,2,4} alongside {0,1,2,4} is normal biology, not a
+    # scheme conflict. The real risk is a value from a DIFFERENT convention
+    # (e.g. ET=3 mixed into a dataset where ET=4), and that is caught by the
+    # "labels within expected" check above.
+    log.add(f"{spec_name}/labels", "label subsets vary across cases (expected)", INFO,
+            {"n_distinct_subsets": len(schemes),
+             "subsets": {str(k): v for k, v in schemes.most_common(6)}},
+            "Cases lacking a subregion simply omit its integer. Only values "
+            "outside the expected set indicate a genuine scheme conflict.")
 
     log.add(f"{spec_name}/labels", "WT>=TC>=ET nesting holds after remap",
             PASS if nest_ok == canon_ok and canon_ok else FAIL,
