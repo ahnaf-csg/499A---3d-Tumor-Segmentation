@@ -81,16 +81,21 @@ def subsample(cases: list[dict], n: int | None, seed: int) -> list[dict]:
 
 def build_transforms(cfg: Config, train: bool):
     keys = ["image", "label"]
+    # ORDER IS LOAD-BEARING. Reorient while the label is still a single-channel
+    # label map WITH its affine metadata; only then expand it into nested region
+    # channels. Doing the region conversion first strips the metadata, and
+    # Orientationd then silently reorients the image but NOT the label --
+    # producing misaligned pairs that train without error and score wrongly.
     base = [
         # image is a LIST of paths -> LoadImaged stacks them into channels in
         # the order given, which is cfg.modalities (canonical bundle order).
-        T.LoadImaged(keys=keys),
-        T.EnsureChannelFirstd(keys=["image"], channel_dim="no_channel")
-        if False else T.Identityd(keys=["image"]),   # LoadImaged already stacks
-        ToCanonicalRegionsd(keys=["label"], dataset=cfg.dataset,
-                            include_rc=cfg.include_rc),
+        T.LoadImaged(keys=keys, ensure_channel_first=False),
+        T.EnsureChannelFirstd(keys=["label"], channel_dim="no_channel"),
         T.EnsureTyped(keys=keys, track_meta=True),
         T.Orientationd(keys=keys, axcodes="RAS"),
+        # label is now (1,H,W,D) RAS -> expand to (C,H,W,D) nested channels
+        ToCanonicalRegionsd(keys=["label"], dataset=cfg.dataset,
+                            include_rc=cfg.include_rc),
         T.CropForegroundd(keys=keys, source_key="image", allow_smaller=True),
         T.NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
     ]
