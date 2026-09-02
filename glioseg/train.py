@@ -55,8 +55,13 @@ def save_ckpt(cfg: Config, model, opt, sched, scaler, epoch, best, history, tag=
         "opt": opt.state_dict(),
         "sched": sched.state_dict() if sched else None,
         "scaler": scaler.state_dict() if scaler else None,
-        "rng": {"torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        # RNG states must be saved as CPU ByteTensors. torch.save/load can
+        # otherwise hand back a type set_rng_state rejects ("RNG state must be
+        # a torch.ByteTensor"), which silently costs exact reproducibility --
+        # and that matters for the multi-seed statistics in Tier 4.
+        "rng": {"torch": torch.get_rng_state().cpu().to(torch.uint8),
+                "cuda": [t.cpu().to(torch.uint8) for t in torch.cuda.get_rng_state_all()]
+                        if torch.cuda.is_available() else None,
                 "numpy": np.random.get_state(), "python": random.getstate()},
         "config_hash": cfg.hash(),
     }, cfg.run_dir / tag)
@@ -79,13 +84,16 @@ def maybe_resume(cfg: Config, model, opt, sched, scaler):
         scaler.load_state_dict(ck["scaler"])
     r = ck.get("rng", {})
     try:
-        torch.set_rng_state(r["torch"])
+        torch.set_rng_state(torch.as_tensor(r["torch"], dtype=torch.uint8).cpu())
         if r.get("cuda") and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(r["cuda"])
+            states = [torch.as_tensor(t, dtype=torch.uint8).cpu() for t in r["cuda"]]
+            if len(states) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all(states)
         np.random.set_state(r["numpy"])
         random.setstate(r["python"])
     except Exception as e:
-        print(f"  [resume] RNG restore skipped: {e}")
+        print(f"  [resume] RNG restore skipped ({e}) -- training continues, but "
+              f"this run is not bit-exact reproducible from the checkpoint")
     print(f"  [resume] continuing from epoch {ck['epoch']+1}, best={ck['best']:.4f}")
     return ck["epoch"] + 1, ck["best"], ck.get("history", [])
 
