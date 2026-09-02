@@ -122,11 +122,22 @@ def build_transforms(cfg: Config, train: bool):
 
     return T.Compose(base + [
         T.SpatialPadd(keys=keys, spatial_size=cfg.patch_size),
+        # MONAI's RandCropByPosNegLabel assumes a multi-channel label is ONE-HOT
+        # and drops channel 0 as background:
+        #     if label.shape[0] > 1: label = label[1:]
+        # Our channels are NESTED regions [WT, TC, ET], so that silently discards
+        # WT and samples on TC only. Cases with edema but no tumour core then
+        # report "Num foregrounds 0" and fall back to uniform random crops.
+        # Fix: guide cropping with a SINGLE-channel WT mask, which bypasses the
+        # one-hot assumption entirely. Dropped again straight after.
+        T.CopyItemsd(keys=["label"], times=1, names=["crop_guide"]),
+        T.Lambdad(keys=["crop_guide"], func=lambda x: x[0:1]),   # WT channel only
         T.RandCropByPosNegLabeld(
-            keys=keys, label_key="label", spatial_size=cfg.patch_size,
-            pos=2, neg=1, num_samples=cfg.samples_per_volume, image_key="image",
-            allow_smaller=True,
+            keys=keys + ["crop_guide"], label_key="crop_guide",
+            spatial_size=cfg.patch_size, pos=2, neg=1,
+            num_samples=cfg.samples_per_volume, allow_smaller=True,
         ),
+        T.DeleteItemsd(keys=["crop_guide"]),
         T.RandFlipd(keys=keys, prob=0.5, spatial_axis=0),
         T.RandFlipd(keys=keys, prob=0.5, spatial_axis=1),
         T.RandFlipd(keys=keys, prob=0.5, spatial_axis=2),
