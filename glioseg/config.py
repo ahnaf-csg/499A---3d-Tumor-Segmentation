@@ -16,7 +16,7 @@ ModelName = Literal["unet3d", "segresnet", "segformer3d", "swinunetr", "mednext"
 LossName = Literal["dice_bce", "dice_focal", "dice"]
 
 # Drive layout, verified 2026-09-02
-DRIVE_BASE = "/content/drive/MyDrive/Colab Notebooks/499A"
+DRIVE_BASE = "/content/drive/MyDrive/Colab Notebooks/499a"
 LOCAL_BASE = "/content/data"
 
 
@@ -51,6 +51,7 @@ class Config:
     samples_per_volume: int = 2          # RandCropByPosNegLabeld num_samples
 
     # --- eval ---
+    num_workers: int = 4                 # data loading is often the bottleneck
     sw_batch_size: int = 2
     sw_overlap: float = 0.5
     val_every: int = 5
@@ -66,6 +67,24 @@ class Config:
     def hash(self) -> str:
         d = asdict(self)
         d.pop("out_root", None)          # moving output dir must not change identity
+        return hashlib.sha256(
+            json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:8]
+
+    # Fields that actually change the CACHED tensors. The deterministic transform
+    # prefix depends only on these -- not on model, loss, lr or epochs.
+    _DATA_FIELDS = ("dataset", "modalities", "include_rc", "n_cases",
+                    "patch_size", "split", "seed")
+
+    def data_hash(self) -> str:
+        """Cache key for PersistentDataset.
+
+        Keying the cache on the FULL config would give every architecture its own
+        copy. At ~60 MB per cached case that is ~55 GB per arm on the full BraTS
+        set, so a 3-arm grid would need ~165 GB and run the Colab disk dry
+        mid-grid. Keying on data-relevant fields only means arms 2 and 3 reuse
+        arm 1's cache -- one copy, and they start fast.
+        """
+        d = {k: getattr(self, k) for k in self._DATA_FIELDS}
         return hashlib.sha256(
             json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
