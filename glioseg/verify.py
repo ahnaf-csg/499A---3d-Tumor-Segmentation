@@ -267,6 +267,46 @@ def check_dataset(spec_name: str, base: str, log: Log, sample: int = 20) -> dict
             "labels": union, "shapes": dict(shapes)}
 
 
+def check_labels_nonempty(spec_name: str, base: str, log: Log) -> list[str]:
+    """Scan EVERY segmentation for an empty label after remapping.
+
+    A case whose label is all-zero makes RandCropByPosNegLabeld fall back to
+    uniform random crops ("Num foregrounds 0"), so that case contributes almost
+    no tumour signal. Segmentations are tiny (~58 KB), so a full scan is cheap
+    and it catches what a 30-case sample cannot.
+    """
+    spec = REGISTRY[spec_name]
+    cases = find_cases(spec, base, verbose=False)
+    empty, odd = [], {}
+    for rec in cases:
+        if "label" not in rec:
+            continue
+        arr = np.asarray(_load(rec["label"]).dataobj)
+        vals = set(int(v) for v in np.unique(arr))
+        unexpected = vals - spec.expected_labels
+        if unexpected:
+            odd[rec["case"]] = sorted(unexpected)
+        canon = to_canonical(arr, spec_name)
+        if canon.max() == 0:
+            empty.append(rec["case"])
+
+    log.add(f"{spec_name}/labels", "every case has a non-empty label after remap",
+            PASS if not empty else FAIL,
+            {"n_scanned": len(cases), "n_empty": len(empty), "empty": empty[:20]},
+            "" if not empty else
+            f"{len(empty)} case(s) remap to an all-zero label. These trigger "
+            f"'Num foregrounds 0' and contribute no tumour signal. Add them to "
+            f"excluded_cases.json.")
+
+    log.add(f"{spec_name}/labels", "no case carries an out-of-scheme value",
+            PASS if not odd else FAIL,
+            {"n_odd": len(odd), "cases": dict(list(odd.items())[:10])},
+            "" if not odd else
+            "These values are dropped by label_map, so their subregions vanish "
+            "silently. Fix datasets.REGISTRY before training.")
+    return empty
+
+
 def check_split(cases: list[dict], split: dict, log: Log) -> None:
     """No subject may appear in more than one split."""
     sets = {k: set(v) for k, v in split.items()}
