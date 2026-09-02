@@ -83,12 +83,24 @@ def _make_transform_class():
             self.include_rc = include_rc
 
         def __call__(self, data):
+            import torch
             d = dict(data)
             for k in self.key_iterator(d):
-                arr = np.asarray(d[k])
-                if arr.ndim == 4 and arr.shape[0] == 1:   # drop channel dim
+                src = d[k]
+                arr = src.cpu().numpy() if hasattr(src, "cpu") else np.asarray(src)
+                if arr.ndim == 4 and arr.shape[0] == 1:   # (1,H,W,D) -> (H,W,D)
                     arr = arr[0]
-                d[k] = to_regions(to_canonical(arr, self.dataset), self.include_rc)
+                out = to_regions(to_canonical(arr, self.dataset), self.include_rc)
+                out = torch.from_numpy(np.ascontiguousarray(out)).to(torch.uint8)
+                # Preserve the MetaTensor wrapper so affine/meta survive. Losing
+                # it breaks downstream spatial transforms AND makes the default
+                # collate fail on numpy ("no attribute 'numel'").
+                if hasattr(src, "meta"):
+                    from monai.data import MetaTensor
+                    out = MetaTensor(out, meta=dict(src.meta),
+                                     applied_operations=list(
+                                         getattr(src, "applied_operations", [])))
+                d[k] = out
             return d
 
     return _ToCanonicalRegionsd
