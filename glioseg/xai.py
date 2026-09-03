@@ -139,6 +139,49 @@ def occlusion_sensitivity(model, x: torch.Tensor, class_idx: int = 2,
     return heat / heat.max() if heat.max() > 1e-8 else heat
 
 
+def tumor_centered_crop(image, gt, pred, cam=None, size=(64, 64, 64),
+                        region: int = 2):
+    """Crop around the tumour centroid instead of the volume corner.
+
+    Cropping [:64,:64,:64] takes the corner of a 240x240x155 volume, which on
+    BraTS contains skull edge and no tumour -- producing an all-zero ground
+    truth panel and a Grad-CAM highlighting the skull rim. Always centre on the
+    structure being explained.
+
+    image: (C,H,W,D) or (H,W,D)   gt/pred: (n_regions,H,W,D)
+    Returns the same arrays cropped, plus the centre used.
+    """
+    g = gt[region] if gt.ndim == 4 else gt
+    idx = np.array(np.nonzero(g > 0))
+    if idx.size == 0:                       # no tumour in this region: use WT
+        g = gt[0] if gt.ndim == 4 else gt
+        idx = np.array(np.nonzero(g > 0))
+    if idx.size == 0:
+        centre = [d // 2 for d in g.shape]
+        print("[xai] WARNING: no foreground in this case; centring on the volume")
+    else:
+        centre = idx.mean(axis=1).round().astype(int).tolist()
+
+    sl = []
+    for c, s_, dim in zip(centre, size, g.shape):
+        lo = max(0, min(c - s_ // 2, dim - s_))
+        sl.append(slice(lo, lo + min(s_, dim)))
+    sl = tuple(sl)
+
+    def cut(a):
+        if a is None:
+            return None
+        return a[(slice(None),) + sl] if a.ndim == 4 else a[sl]
+
+    out = {"image": cut(image), "gt": cut(gt), "pred": cut(pred),
+           "cam": cut(cam), "centre": centre,
+           "gt_voxels_in_crop": int((cut(gt)[region] > 0).sum()
+                                    if gt.ndim == 4 else (cut(gt) > 0).sum())}
+    print(f"[xai] cropped around centroid {centre}, "
+          f"{out['gt_voxels_in_crop']} target voxels in crop")
+    return out
+
+
 def overlay_figure(image: np.ndarray, cam: np.ndarray, gt: np.ndarray | None = None,
                    pred: np.ndarray | None = None, slice_idx: int | None = None,
                    out_path: str | None = None, title: str = ""):
