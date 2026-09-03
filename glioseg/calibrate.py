@@ -162,32 +162,163 @@ def calibrate(model, val_loader, test_loader, cfg: Config,
     return res
 
 
+def per_case_optimal_threshold(cached: list[dict], thresholds=THRESHOLDS,
+                               region: str = "ET") -> list[dict]:
+    """Best threshold for EACH case, with its lesion volume.
+
+    This is the binning-free alternative to threshold_by_volume. Binning throws
+    away information and produces cells with n=1 or 2 that support no claim; a
+    per-case value lets you regress threshold on log-volume and use every case.
+    """
+    ci = REGION_NAMES.index(region)
+    out = []
+    for c in cached:
+        if not c["gt"][ci].any():
+            continue
+        vol = float(c["gt"][ci].sum() * c["voxel_mm3"] / 1000.0)
+        curve = [(float(t), binary_scores(c["probs"][ci] >= t, c["gt"][ci])["dice"])
+                 for t in thresholds]
+        best_t, best_d = max(curve, key=lambda x: x[1])
+        d50 = dict(curve).get(0.5, float("nan"))
+        out.append({"case": c["case"], "volume_cm3": vol,
+                    "log10_volume": float(np.log10(max(vol, 1e-3))),
+                    "best_threshold": best_t, "best_dice": round(best_d, 4),
+                    "dice_at_0.5": round(d50, 4),
+                    "gain": round(best_d - d50, 4)})
+    return out
+
+
+def threshold_volume_regression(per_case: list[dict], n_boot: int = 2000,
+                                seed: int = 0) -> dict:
+    """Does the optimal threshold depend on lesion size? Continuous test.
+
+    Regresses per-case optimal threshold on log10 lesion volume. Uses every case
+    with a non-empty region, so no bin is ever too thin to interpret. A slope
+    whose CI excludes zero means no single global threshold serves all sizes.
+    """
+    if len(per_case) < 8:
+        return {"n": len(per_case), "note": "too few cases to regress"}
+    x = np.array([r["log10_volume"] for r in per_case])
+    y = np.array([r["best_threshold"] for r in per_case])
+
+    slope, intercept = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+
+    rng = np.random.default_rng(seed)
+    slopes = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(x), len(x))
+        if len(np.unique(x[i])) > 1:
+            slopes.append(np.polyfit(x[i], y[i], 1)[0])
+    lo, hi = np.percentile(slopes, [2.5, 97.5]) if slopes else (np.nan, np.nan)
+
+    try:
+        from scipy.stats import spearmanr
+        rho, pval = spearmanr(x, y)
+    except ImportError:
+        rho, pval = float("nan"), float("nan")
+
+    return {"n": len(per_case),
+            "slope_per_decade": round(float(slope), 4),
+            "slope_95ci": (round(float(lo), 4), round(float(hi), 4)),
+            "significant": bool(not (lo <= 0 <= hi)),
+            "pearson_r": round(r, 4), "r_squared": round(r**2, 4),
+            "spearman_rho": round(float(rho), 4), "spearman_p": round(float(pval), 6),
+            "interpretation": (
+                "optimal threshold varies with lesion size -- no single global "
+                "threshold serves all sizes"
+                if not (lo <= 0 <= hi) else
+                "no detectable size dependence; a global threshold is adequate")}
+
+
 def threshold_by_volume(cached: list[dict], thresholds=THRESHOLDS,
-                        bins=((0, 2), (2, 5), (5, 15), (15, 1e9))) -> list[dict]:
+                        bins=((0, 2), (2, 5), (5, 15), (15, 1e9)),
+                        n_boot: int = 1000, min_n: int = 8, seed: int = 0) -> list[dict]:
     """Does the optimal threshold depend on lesion size?
 
-    If small lesions prefer a lower threshold and large ones a higher one, then
-    no single global threshold can serve both -- which is a second finding, and
-    an argument for size-aware post-processing.
+    If small lesions prefer a lower threshold and large ones a higher one, no
+    single global threshold serves both -- which argues for size-aware
+    post-processing.
+
+    BINNING MATTERS. On BraTS the six-bin scheme used for stratified Dice leaves
+    n = 12/2/6/13/44/112, so the middle bins cannot support a threshold estimate.
+    The default here merges to four bins (n ~ 20/13/44/112), and the smallest is
+    still reported with a bootstrap interval so the reader can judge it.
+
+    A point estimate of "the best threshold" is meaningless without a spread:
+    the Dice-vs-threshold curve is flat near its peak, so the argmax jumps
+    between adjacent grid values on resampling. We therefore bootstrap over
+    cases within each bin and report the DISTRIBUTION of optimal thresholds.
     """
     et = REGION_NAMES.index("ET")
+    rng = np.random.default_rng(seed)
     rows = []
+
     for lo, hi in bins:
         sel = [c for c in cached
                if lo <= c["gt"][et].sum() * c["voxel_mm3"] / 1000.0 < hi
                and c["gt"][et].any()]
         if not sel:
             continue
-        best_t, best_d = None, -1.0
-        curve = []
-        for t in thresholds:
-            d = float(np.mean([binary_scores(c["probs"][et] >= t, c["gt"][et])["dice"]
-                               for c in sel]))
-            curve.append((float(t), round(d, 4)))
-            if d > best_d:
-                best_t, best_d = float(t), d
-        rows.append({"bin_cm3": f"{lo}-{'inf' if hi > 1e8 else hi}", "n": len(sel),
-                     "best_threshold": best_t, "best_ET_dice": round(best_d, 4),
-                     "dice_at_0.5": round(dict(curve)[0.5], 4) if 0.5 in dict(curve) else None,
-                     "curve": curve})
+
+        # per-case Dice at every threshold, computed once and reused by the bootstrap
+        per_case = np.array([[binary_scores(c["probs"][et] >= t, c["gt"][et])["dice"]
+                              for t in thresholds] for c in sel])   # (n_cases, n_thr)
+        mean_curve = per_case.mean(axis=0)
+        best_i = int(mean_curve.argmax())
+
+        row = {"bin_cm3": f"{lo}-{'inf' if hi > 1e8 else hi}", "n": len(sel),
+               "best_threshold": float(thresholds[best_i]),
+               "best_ET_dice": round(float(mean_curve[best_i]), 4),
+               "dice_at_0.5": round(float(mean_curve[list(thresholds).index(0.5)]), 4)
+                              if 0.5 in list(thresholds) else None,
+               "gain_over_0.5": None,
+               "curve": [(float(t), round(float(d), 4))
+                         for t, d in zip(thresholds, mean_curve)]}
+        if row["dice_at_0.5"] is not None:
+            row["gain_over_0.5"] = round(row["best_ET_dice"] - row["dice_at_0.5"], 4)
+
+        if len(sel) >= min_n:
+            # bootstrap the argmax so the point estimate carries a spread
+            boots = []
+            for _ in range(n_boot):
+                idx = rng.integers(0, len(sel), len(sel))
+                boots.append(float(thresholds[int(per_case[idx].mean(axis=0).argmax())]))
+            row["threshold_95ci"] = (round(float(np.percentile(boots, 2.5)), 2),
+                                     round(float(np.percentile(boots, 97.5)), 2))
+            row["threshold_iqr"] = (round(float(np.percentile(boots, 25)), 2),
+                                    round(float(np.percentile(boots, 75)), 2))
+            # how flat is the peak? if many thresholds are within 1% of the best,
+            # the argmax is not identifiable and should not be over-read
+            near = int((mean_curve >= mean_curve[best_i] - 0.01).sum())
+            row["n_thresholds_within_1pct"] = near
+        else:
+            row["threshold_95ci"] = None
+            row["note"] = f"n={len(sel)} < {min_n}: point estimate only, do not interpret"
+        rows.append(row)
     return rows
+
+
+def thresholds_differ_by_size(rows: list[dict]) -> dict:
+    """Do two size bins genuinely prefer different thresholds?
+
+    Answered by CI overlap, not by comparing point estimates. Returns the
+    verdict so the report can state it rather than implying it from a table.
+    """
+    usable = [r for r in rows if r.get("threshold_95ci")]
+    if len(usable) < 2:
+        return {"verdict": "insufficient data", "n_usable_bins": len(usable)}
+
+    small, large = usable[0], usable[-1]
+    (sl, sh), (ll, lh) = small["threshold_95ci"], large["threshold_95ci"]
+    overlap = not (sh < ll or lh < sl)
+    return {
+        "smallest_bin": small["bin_cm3"], "largest_bin": large["bin_cm3"],
+        "smallest_threshold": small["best_threshold"], "smallest_95ci": (sl, sh),
+        "largest_threshold": large["best_threshold"], "largest_95ci": (ll, lh),
+        "cis_overlap": overlap,
+        "verdict": ("no evidence that optimal threshold depends on lesion size "
+                    "(CIs overlap)" if overlap else
+                    "optimal threshold DOES depend on lesion size (CIs disjoint) "
+                    "-- no single global threshold serves both"),
+    }
