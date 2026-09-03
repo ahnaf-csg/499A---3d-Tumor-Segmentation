@@ -64,9 +64,16 @@ class Config:
     def n_out(self) -> int:
         return 4 if self.include_rc else 3
 
+    # Excluded from the run identity. `epochs` is a BUDGET, not a configuration:
+    # excluding it means a 5-epoch pilot and a 15-epoch full run share one
+    # directory, so extending the pilot RESUMES instead of starting over. That
+    # makes a cheap pilot free. `epochs_run` in result.json records what was
+    # actually done, so provenance is preserved.
+    _HASH_EXCLUDE = ("out_root", "epochs", "num_workers", "sw_batch_size",
+                     "cache_dir", "postproc_min_voxels")
+
     def hash(self) -> str:
-        d = asdict(self)
-        d.pop("out_root", None)          # moving output dir must not change identity
+        d = {k: v for k, v in asdict(self).items() if k not in self._HASH_EXCLUDE}
         return hashlib.sha256(
             json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
