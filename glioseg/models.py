@@ -17,7 +17,7 @@ from .config import Config
 # its bottleneck collapses to 1x1x1 and normalisation raises. Found by testing;
 # not documented upstream.
 MIN_PATCH = {"unet3d": 32, "segresnet": 32, "segformer3d": 32,
-             "swinunetr": 64, "mednext": 32}
+             "swinunetr": 64, "mednext": 32, "attentionunet": 32}
 
 CITATIONS = {
     "unet3d":      "Cicek et al., MICCAI 2016, arXiv:1606.06650",
@@ -25,6 +25,7 @@ CITATIONS = {
     "segformer3d": "Perera, Navard & Yilmaz, CVPR Workshops 2024, arXiv:2404.10156",
     "swinunetr":   "Hatamizadeh et al., 2022, arXiv:2201.01266",
     "mednext":     "Roy et al., MICCAI 2023, arXiv:2303.09975",
+    "attentionunet": "Oktay et al., MIDL 2018, arXiv:1804.03999",
 }
 
 
@@ -57,6 +58,18 @@ def build_model(cfg: Config) -> nn.Module:
     if cfg.model == "segformer3d":
         from .segformer3d import SegFormer3D
         return SegFormer3D(in_channels=cin, num_classes=cout, **kw)
+
+    if cfg.model == "attentionunet":
+        # Oktay et al., "Attention U-Net: Learning Where to Look for the
+        # Pancreas", MIDL 2018, arXiv:1804.03999. Attention gates suppress
+        # irrelevant regions in the skip connections -- directly relevant to a
+        # model whose failure is spurious activation around true lesions.
+        from monai.networks.nets import AttentionUnet
+        return AttentionUnet(
+            spatial_dims=3, in_channels=cin, out_channels=cout,
+            channels=kw.pop("channels", (16, 32, 64, 128, 256)),
+            strides=kw.pop("strides", (2, 2, 2, 2)),
+            dropout=kw.pop("dropout", 0.0), **kw)
 
     if cfg.model == "swinunetr":
         from monai.networks.nets import SwinUNETR
