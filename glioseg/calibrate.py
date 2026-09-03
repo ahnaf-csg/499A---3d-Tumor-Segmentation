@@ -35,6 +35,14 @@ def collect_probabilities(model, loader, cfg: Config, device=None, max_cases=Non
     cap max_cases if RAM is tight."""
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
+    n_total = len(loader) if hasattr(loader, "__len__") else None
+    if n_total:
+        # 3 channels x 240x240x155 x 2 bytes (float16) = ~54 MB per case.
+        est = n_total * 54 / 1024
+        if est > 4:
+            print(f"    WARNING: caching {n_total} cases needs ~{est:.1f} GB RAM. "
+                  f"Colab has ~12.7 GB. Use sweep_streaming/threshold_by_volume_streaming "
+                  f"instead, which stores 18 floats per case rather than the maps.")
     out = []
     for i, batch in enumerate(loader):
         if max_cases and i >= max_cases:
@@ -322,3 +330,120 @@ def thresholds_differ_by_size(rows: list[dict]) -> dict:
                     "optimal threshold DOES depend on lesion size (CIs disjoint) "
                     "-- no single global threshold serves both"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Streaming variants -- constant memory
+# --------------------------------------------------------------------------- #
+#
+# collect_probabilities() keeps every case's probability map in RAM: at BraTS
+# size that is ~54 MB per case, so 189 cases needs ~10 GB and Colab OOMs.
+#
+# Nothing downstream actually needs the maps. A threshold sweep needs only, per
+# case, the ET volume (one scalar) and the Dice at each threshold (17 floats).
+# These variants compute that during inference and discard the maps immediately,
+# so memory is constant in the number of cases.
+
+@torch.no_grad()
+def sweep_streaming(model, loader, cfg: Config, thresholds=THRESHOLDS,
+                    device=None, verbose=True):
+    """One inference pass -> per-case Dice at every threshold, maps discarded.
+
+    Returns (rows, per_case) where per_case carries the small arrays needed by
+    threshold_by_volume_streaming.
+    """
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    names = REGION_NAMES
+    per_case = []
+
+    for i, batch in enumerate(loader):
+        x = batch["image"].to(dev)
+        with torch.autocast(dev, dtype=torch.float16, enabled=cfg.amp and dev == "cuda"):
+            logits = sliding_window_inference(
+                x, cfg.patch_size, cfg.sw_batch_size, model,
+                overlap=cfg.sw_overlap, mode="gaussian")
+        probs = torch.sigmoid(logits.float())[0].cpu().numpy()
+        gt = batch["label"][0].cpu().numpy().astype(bool)
+        mm3 = voxel_volume_mm3(_affine_of(batch))
+
+        rec = {"case": (batch.get("case", ["?"])[0]
+                        if isinstance(batch.get("case"), (list, tuple)) else "?"),
+               "voxel_mm3": mm3,
+               "gt_volume_cm3": float(gt[names.index("ET")].sum() * mm3 / 1000.0),
+               "gt_empty": {n: not gt[ci].any() for ci, n in enumerate(names)}}
+        # (n_regions, n_thresholds) of Dice, plus precision/recall for the sweep
+        for ci, nm in enumerate(names):
+            d, pr, rc = [], [], []
+            for t in thresholds:
+                sc = binary_scores(probs[ci] >= t, gt[ci])
+                d.append(sc["dice"]); pr.append(sc["precision"]); rc.append(sc["recall"])
+            rec[f"{nm}_dice"] = np.array(d, dtype=np.float32)
+            rec[f"{nm}_precision"] = np.array(pr, dtype=np.float32)
+            rec[f"{nm}_recall"] = np.array(rc, dtype=np.float32)
+        per_case.append(rec)
+        del probs, gt                      # release before the next case
+        if verbose and (i + 1) % 25 == 0:
+            print(f"    swept {i+1} cases", flush=True)
+
+    if verbose:
+        print(f"    swept {len(per_case)} cases total "
+              f"(~{len(per_case)*len(thresholds)*9*4/2**20:.1f} MB retained)")
+
+    rows = []
+    for ti, t in enumerate(thresholds):
+        row = {"threshold": float(t)}
+        for nm in names:
+            vals = {k: [c[f"{nm}_{k}"][ti] for c in per_case if not c["gt_empty"][nm]]
+                    for k in ("dice", "precision", "recall")}
+            if not vals["dice"]:
+                continue
+            for k, v in vals.items():
+                row[f"{nm}_{k}"] = float(np.mean(v))
+            row[f"{nm}_n"] = len(vals["dice"])
+        for k in ("dice", "precision", "recall"):
+            got = [row[f"{n}_{k}"] for n in names if f"{n}_{k}" in row]
+            row[f"mean_{k}"] = float(np.mean(got)) if got else np.nan
+        rows.append(row)
+    return rows, per_case
+
+
+def threshold_by_volume_streaming(per_case: list[dict], thresholds=THRESHOLDS,
+                                  bins=((0, 2), (2, 5), (5, 15), (15, 1e9)),
+                                  n_boot: int = 1000, min_n: int = 8,
+                                  seed: int = 0) -> list[dict]:
+    """Same analysis as threshold_by_volume, from sweep_streaming's small output."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for lo, hi in bins:
+        sel = [c for c in per_case
+               if lo <= c["gt_volume_cm3"] < hi and not c["gt_empty"]["ET"]]
+        if not sel:
+            continue
+        mat = np.stack([c["ET_dice"] for c in sel])          # (n_cases, n_thr)
+        mean_curve = mat.mean(axis=0)
+        bi = int(mean_curve.argmax())
+        i05 = list(thresholds).index(0.5) if 0.5 in list(thresholds) else None
+
+        row = {"bin_cm3": f"{lo}-{'inf' if hi > 1e8 else hi}", "n": len(sel),
+               "best_threshold": float(thresholds[bi]),
+               "best_ET_dice": round(float(mean_curve[bi]), 4),
+               "dice_at_0.5": round(float(mean_curve[i05]), 4) if i05 is not None else None,
+               "curve": [(float(t), round(float(d), 4))
+                         for t, d in zip(thresholds, mean_curve)]}
+        if row["dice_at_0.5"] is not None:
+            row["gain_over_0.5"] = round(row["best_ET_dice"] - row["dice_at_0.5"], 4)
+
+        if len(sel) >= min_n:
+            boots = [float(thresholds[int(mat[rng.integers(0, len(sel), len(sel))]
+                                          .mean(axis=0).argmax())])
+                     for _ in range(n_boot)]
+            row["threshold_95ci"] = (round(float(np.percentile(boots, 2.5)), 2),
+                                     round(float(np.percentile(boots, 97.5)), 2))
+            row["n_thresholds_within_1pct"] = int(
+                (mean_curve >= mean_curve[bi] - 0.01).sum())
+        else:
+            row["threshold_95ci"] = None
+            row["note"] = f"n={len(sel)} < {min_n}: point estimate only"
+        rows.append(row)
+    return rows
