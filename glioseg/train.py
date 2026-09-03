@@ -120,8 +120,14 @@ def train_arm(cfg: Config, split_path=None, verbose=True) -> dict:
     start, best, history = maybe_resume(cfg, model, opt, sched, scaler)
 
     if verbose:
-        print(f"\n=== {cfg.name} | {cfg.model} | {sizing['params_M']}M params "
-              f"| {sizing['model_size_MB']}MB | {dev} | patch {cfg.patch_size}")
+        print(f"\n=== {cfg.name} | {cfg.model} | loss={cfg.loss} | "
+              f"{sizing['params_M']}M params | {sizing['model_size_MB']}MB | {dev} "
+              f"| patch {cfg.patch_size} | n_train={meta['counts']['train']}")
+        if start >= cfg.epochs:
+            print(f"    already complete at {start} epochs -- raise cfg.epochs "
+                  f"to extend, or delete {cfg.run_dir.name} to redo")
+        elif start:
+            print(f"    RESUMING at epoch {start+1}/{cfg.epochs}")
 
     t0_all = time.time()
     for ep in range(start, cfg.epochs):
@@ -164,9 +170,18 @@ def train_arm(cfg: Config, split_path=None, verbose=True) -> dict:
         (cfg.run_dir / "history.json").write_text(json.dumps(history, indent=2))
 
         if verbose:
-            msg = f"  ep {ep+1:>3}/{cfg.epochs}  loss {row['train_loss']:.4f}  {dt:.1f}s"
+            left = cfg.epochs - ep - 1
+            recent = [r["epoch_time_s"] for r in history[-3:]]   # history, not a
+            eta = np.mean(recent) * left / 60 if recent and left else 0
+            msg = (f"  ep {ep+1:>3}/{cfg.epochs}  loss {row['train_loss']:.4f}  "
+                   f"{dt:.0f}s")
             if row.get("val_mean_dice") is not None:
-                msg += f"  val_dice {row['val_mean_dice']:.4f}"
+                msg += (f"  val_dice {row['val_mean_dice']:.4f}"
+                        f"  ET {row.get('val_ET_dice', float('nan')):.4f}")
+            if left:
+                msg += f"  | ETA {eta:.0f}min"
+            if torch.cuda.is_available():
+                msg += f"  vram {torch.cuda.max_memory_allocated()/2**20:.0f}MB"
             print(msg, flush=True)
 
     total = time.time() - t0_all
@@ -182,6 +197,8 @@ def train_arm(cfg: Config, split_path=None, verbose=True) -> dict:
     result = {
         "name": cfg.name, "model": cfg.model, "dataset": cfg.dataset,
         "config_hash": cfg.hash(), "seed": cfg.seed,
+        "peak_MB": (round(torch.cuda.max_memory_allocated() / 2**20, 1)
+                    if dev == "cuda" else None),
         "pretrained": cfg.pretrained, "loss": cfg.loss,
         "patch": list(cfg.patch_size), "n_modalities": len(cfg.modalities),
         "n_cases": meta["n_cases"], "split_counts": meta["counts"],
