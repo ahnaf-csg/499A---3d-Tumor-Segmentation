@@ -83,6 +83,24 @@ REGISTRY: dict[str, DatasetSpec] = {
         expected_labels={0, 1, 2, 4},
         notes="pre-operative; SOURCE domain. '_t1' must be matched AFTER '_t1ce'.",
     ),
+    "sailor": DatasetSpec(
+        name="sailor",
+        root="sailor_ebrains_pseud/derivatives/mni2009c-n-s",
+        modality_suffix={"t1c": "T1c", "t1n": "T1", "t2w": "T2", "t2f": "Flair"},
+        seg_suffix="Segmentation-ONCO",
+        # ONCOhabitats combined map: 1=necrosis, 2=edema, 3=enhancing. Already
+        # canonical -- written out so the assumption is visible, not implied.
+        label_map={0: 0, 1: 1, 2: 2, 3: 3},
+        case_depth=2,
+        subject_regex=r"sub-\d+",
+        expected_labels={0, 1, 2, 3},
+        notes="POST-TREATMENT, external validation only -- never trained on. "
+              "193x229x193 MNI152 (not 240x240x155). Intensities are uint8 "
+              "rescaled 0-255 with PLHM normalisation, so per-volume z-scoring "
+              "inside the brain mask is essential. Expert CL masks exist for "
+              "240/270 sessions only; sub-24 has none and sub-15 is partial. "
+              "Timing: intervals-days.txt, per patient, one integer per gap.",
+    ),
     "mu_post": DatasetSpec(
         name="mu_post",
         root="MU-Glioma-Post",
