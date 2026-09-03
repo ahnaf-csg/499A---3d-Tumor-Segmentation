@@ -12,7 +12,8 @@ from typing import Literal
 
 from .datasets import CANONICAL_MODALITY_ORDER
 
-ModelName = Literal["unet3d", "segresnet", "segformer3d", "swinunetr", "mednext"]
+ModelName = Literal["unet3d", "segresnet", "segformer3d", "swinunetr",
+                    "mednext", "attentionunet"]
 LossName = Literal["dice_bce", "dice_focal", "dice"]
 
 # Drive layout, verified 2026-09-02
