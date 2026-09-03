@@ -88,6 +88,57 @@ class DiceFocalLoss(nn.Module):
         return self.alpha * dice + self.beta * focal
 
 
+class TverskyBCELoss(nn.Module):
+    """Per-channel Tversky + BCE-with-logits.
+
+    Tversky index generalises Dice by weighting the two error types separately:
+
+        TI = TP / (TP + alpha*FP + beta*FN)
+
+    alpha = beta = 0.5 recovers Dice exactly.
+
+    DIRECTION MATTERS AND IS COUNTERINTUITIVE. Salehi et al. (arXiv:1706.05721)
+    tuned beta > alpha because their MS-lesion models UNDER-segmented and they
+    wanted recall. Our models OVER-segment (recall 0.92 vs precision 0.74), so we
+    need the opposite: alpha > beta, penalising false positives harder to buy
+    precision back.
+
+    Reference: Salehi, Erdogmus & Gholipour, "Tversky loss function for image
+    segmentation using 3D fully convolutional deep networks", MLMI/MICCAI 2017,
+    arXiv:1706.05721. Focal variant: Abraham & Khan, ISBI 2019, arXiv:1810.07842.
+    """
+
+    def __init__(self, alpha: float = 0.7, beta: float | None = None,
+                 gamma: float | None = None, bce_weight: float = 1.0,
+                 smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
+        super().__init__()
+        if beta is None:
+            beta = 1.0 - alpha          # convention: alpha + beta = 1
+        self.alpha, self.beta = alpha, beta
+        self.gamma = gamma              # None = plain Tversky; set ~4/3 for focal
+        self.bce_weight = bce_weight
+        self.smooth_nr, self.smooth_dr = smooth_nr, smooth_dr
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        target = target.float()
+        probs = torch.sigmoid(logits)
+        dims = tuple(range(2, probs.ndim))          # spatial only -> (B, C)
+
+        tp = (probs * target).sum(dims)
+        fp = (probs * (1 - target)).sum(dims)
+        fn = ((1 - probs) * target).sum(dims)
+
+        ti = (tp + self.smooth_nr) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth_dr)
+        loss_t = 1.0 - ti
+        if self.gamma is not None:                  # Focal Tversky
+            loss_t = loss_t.clamp(min=1e-6) ** self.gamma
+
+        bce = F.binary_cross_entropy_with_logits(logits, target)
+        return loss_t.mean() + self.bce_weight * bce
+
+
 class DiceOnly(nn.Module):
     """Ablation control: Dice with no cross-entropy term."""
 
@@ -100,10 +151,20 @@ class DiceOnly(nn.Module):
 
 
 def build_loss(name: str, **kw) -> nn.Module:
+    """Loss registry. Names ending in a number encode alpha, e.g. 'tversky70'
+    means alpha=0.70 (favouring precision), so the ablation table reads cleanly.
+    """
     if name == "dice_bce":
         return DiceBCELoss(**kw)
     if name == "dice_focal":
         return DiceFocalLoss(**kw)
     if name == "dice":
         return DiceOnly(**kw)
+    if name.startswith("tversky"):
+        suffix = name[len("tversky"):].rstrip("f")
+        alpha = float(suffix) / 100.0 if suffix else 0.7
+        if not 0.0 < alpha < 1.0:
+            raise ValueError(f"alpha must be in (0,1), parsed {alpha} from '{name}'")
+        focal = name.endswith("f")
+        return TverskyBCELoss(alpha=alpha, gamma=(4/3 if focal else None), **kw)
     raise ValueError(f"unknown loss '{name}'")
