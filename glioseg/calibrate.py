@@ -374,13 +374,16 @@ def sweep_streaming(model, loader, cfg: Config, thresholds=THRESHOLDS,
                "gt_empty": {n: not gt[ci].any() for ci, n in enumerate(names)}}
         # (n_regions, n_thresholds) of Dice, plus precision/recall for the sweep
         for ci, nm in enumerate(names):
-            d, pr, rc = [], [], []
+            d, pr, rc, pv = [], [], [], []
             for t in thresholds:
-                sc = binary_scores(probs[ci] >= t, gt[ci])
+                m = probs[ci] >= t
+                sc = binary_scores(m, gt[ci])
                 d.append(sc["dice"]); pr.append(sc["precision"]); rc.append(sc["recall"])
+                pv.append(m.sum() * mm3 / 1000.0)      # PREDICTED volume, cm^3
             rec[f"{nm}_dice"] = np.array(d, dtype=np.float32)
             rec[f"{nm}_precision"] = np.array(pr, dtype=np.float32)
             rec[f"{nm}_recall"] = np.array(rc, dtype=np.float32)
+            rec[f"{nm}_pred_vol"] = np.array(pv, dtype=np.float32)
         per_case.append(rec)
         del probs, gt                      # release before the next case
         if verbose and (i + 1) % 25 == 0:
@@ -447,3 +450,111 @@ def threshold_by_volume_streaming(per_case: list[dict], thresholds=THRESHOLDS,
             row["note"] = f"n={len(sel)} < {min_n}: point estimate only"
         rows.append(row)
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive, size-aware thresholding
+# --------------------------------------------------------------------------- #
+#
+# threshold_by_volume shows the optimal threshold depends on lesion size:
+# small lesions want a HIGH threshold, large ones a LOW one. The mechanism is a
+# low-confidence probability halo of roughly constant absolute thickness --
+# negligible around a large lesion, dominant around a small one.
+#
+# A single global threshold therefore cannot serve both. But size can be
+# ESTIMATED FROM THE PREDICTION ITSELF: threshold once at a neutral value,
+# measure the predicted volume, then re-threshold using the value tuned for that
+# size band. Two passes over probabilities already computed -- no extra inference.
+#
+# The bin edges and per-bin thresholds must be fitted on VALIDATION and applied
+# unchanged to test, exactly as for the global threshold.
+
+def fit_adaptive(per_case_val: list[dict], thresholds=THRESHOLDS,
+                 bins=((0, 2), (2, 5), (5, 15), (15, 1e9)),
+                 probe_threshold: float = 0.5, region: str = "ET") -> dict:
+    """Fit the size->threshold map on validation.
+
+    Bins are defined on PREDICTED volume at `probe_threshold`, not on true
+    volume, because at inference the true volume is unknown.
+    """
+    thr = list(thresholds)
+    probe_i = thr.index(probe_threshold)
+    table = []
+    for lo, hi in bins:
+        sel = [c for c in per_case_val
+               if not c["gt_empty"][region]
+               and lo <= c[f"{region}_pred_vol"][probe_i] < hi]
+        if not sel:
+            table.append({"bin": (lo, hi), "n": 0, "threshold": probe_threshold})
+            continue
+        curve = np.stack([c[f"{region}_dice"] for c in sel]).mean(axis=0)
+        bi = int(curve.argmax())
+        table.append({"bin": (lo, hi), "n": len(sel),
+                      "threshold": float(thr[bi]),
+                      "val_dice_at_probe": round(float(curve[probe_i]), 4),
+                      "val_dice_at_best": round(float(curve[bi]), 4)})
+    return {"region": region, "probe_threshold": probe_threshold,
+            "thresholds": thr, "table": table}
+
+
+def apply_adaptive(per_case: list[dict], fitted: dict) -> dict:
+    """Apply the fitted size->threshold map. Compares against the probe
+    threshold and against the best single global threshold, so the reader can
+    see whether adaptivity beats simply tuning one number."""
+    region = fitted["region"]
+    thr = fitted["thresholds"]
+    probe_i = thr.index(fitted["probe_threshold"])
+
+    def band(v):
+        for row in fitted["table"]:
+            lo, hi = row["bin"]
+            if lo <= v < hi:
+                return row["threshold"]
+        return fitted["probe_threshold"]
+
+    usable = [c for c in per_case if not c["gt_empty"][region]]
+    probe, adapt, chosen = [], [], []
+    for c in usable:
+        probe.append(float(c[f"{region}_dice"][probe_i]))
+        t = band(float(c[f"{region}_pred_vol"][probe_i]))
+        chosen.append(t)
+        adapt.append(float(c[f"{region}_dice"][thr.index(t)]))
+
+    # best single global threshold, for a fair comparison
+    curve = np.stack([c[f"{region}_dice"] for c in usable]).mean(axis=0)
+    gi = int(curve.argmax())
+    glob = [float(c[f"{region}_dice"][gi]) for c in usable]
+
+    probe, adapt, glob = np.array(probe), np.array(adapt), np.array(glob)
+    out = {"region": region, "n": len(usable),
+           "dice_probe": round(float(probe.mean()), 4),
+           "dice_global_best": round(float(glob.mean()), 4),
+           "global_best_threshold": float(thr[gi]),
+           "dice_adaptive": round(float(adapt.mean()), 4),
+           "gain_vs_probe": round(float(adapt.mean() - probe.mean()), 4),
+           "gain_vs_global": round(float(adapt.mean() - glob.mean()), 4),
+           "thresholds_used": {f"{t:.2f}": int((np.array(chosen) == t).sum())
+                               for t in sorted(set(chosen))}}
+
+    # paired test: does adaptive beat the best single global threshold?
+    try:
+        from scipy.stats import wilcoxon
+        if not np.allclose(adapt, glob):
+            st, pv = wilcoxon(adapt, glob)
+            d = adapt - glob
+            out["vs_global_wilcoxon_p"] = float(pv)
+            out["vs_global_cohens_d"] = round(float(d.mean() / (d.std(ddof=1) + 1e-12)), 4)
+    except Exception:
+        pass
+
+    # per-true-size breakdown, to show where adaptivity actually helps
+    out["by_true_volume"] = []
+    for lo, hi in ((0, 2), (2, 5), (5, 15), (15, 1e9)):
+        idx = [i for i, c in enumerate(usable) if lo <= c["gt_volume_cm3"] < hi]
+        if idx:
+            out["by_true_volume"].append({
+                "bin_cm3": f"{lo}-{'inf' if hi > 1e8 else hi}", "n": len(idx),
+                "probe": round(float(probe[idx].mean()), 4),
+                "global": round(float(glob[idx].mean()), 4),
+                "adaptive": round(float(adapt[idx].mean()), 4)})
+    return out
