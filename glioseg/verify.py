@@ -90,7 +90,9 @@ def check_environment(log: Log) -> None:
                 "train.py handles this automatically.")
 
 
-def check_integrity(spec_name: str, base: str, log: Log) -> list[str]:
+def check_integrity(spec_name: str, base: str, log: Log,
+                    deep: bool = True, only_cases: set[str] | None = None
+                    ) -> list[str]:
     """stat() EVERY NIfTI under the root. Sampling misses corrupt files, and one
     of them will crash an overnight run at an unpredictable point.
 
@@ -99,6 +101,9 @@ def check_integrity(spec_name: str, base: str, log: Log) -> list[str]:
     spec = REGISTRY[spec_name]
     root = resolve_root(spec, base)
     files = list(root.rglob("*.nii*"))
+    if only_cases:                      # scope to a split instead of all 6,255 files
+        files = [f for f in files
+                 if f.parent.name in only_cases or f.parent.parent.name in only_cases]
 
     bad = []
     for f in files:
@@ -106,12 +111,26 @@ def check_integrity(spec_name: str, base: str, log: Log) -> list[str]:
         if sz == 0:
             bad.append((str(f.relative_to(root)), sz, "zero bytes"))
             continue
-        # Header read only -- nibabel is lazy, so this does not load voxel data.
-        # Catches truncated or corrupt files that a size threshold would miss.
+        # A header read is NOT enough. nibabel is lazy, so .shape touches only
+        # the first ~350 bytes -- a file truncated later has a valid header and
+        # fails only when the voxel data is decompressed. That gap let a
+        # truncated file pass verification and crash a dataloader mid-run.
+        # `deep=True` streams the whole gzip member, which is the only reliable
+        # test for truncation.
         try:
             _load(f).shape
         except Exception as e:
-            bad.append((str(f.relative_to(root)), sz, f"unreadable: {type(e).__name__}"))
+            bad.append((str(f.relative_to(root)), sz, f"bad header: {type(e).__name__}"))
+            continue
+        if deep and f.name.endswith(".gz"):
+            try:
+                import gzip
+                with gzip.open(f, "rb") as fh:
+                    while fh.read(1 << 20):        # 1 MB chunks, constant memory
+                        pass
+            except Exception as e:
+                bad.append((str(f.relative_to(root)), sz,
+                            f"truncated: {type(e).__name__}"))
     bad_dirs = sorted({Path(b[0]).parent.name for b in bad})
 
     log.add(f"{spec_name}/integrity", "every NIfTI is non-empty",
@@ -333,7 +352,7 @@ def run_all(base: str, datasets=("brats2021",), sample: int = 20,
     for ds in datasets:
         print(f"\n{'-'*70}\n  {ds}\n{'-'*70}")
         try:
-            check_integrity(ds, base, log)      # full scan first -- cheap, stat() only
+            check_integrity(ds, base, log, deep=False)   # fast pass: headers only
             out[ds] = check_dataset(ds, base, log, sample)
         except Exception as e:
             log.add(f"{ds}/run", "check completed", FAIL, note=f"{type(e).__name__}: {e}")
