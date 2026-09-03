@@ -100,6 +100,9 @@ def pick_target_layer(model: torch.nn.Module, model_name: str) -> torch.nn.Modul
         "swinunetr":   ["encoder10", "encoder4", "decoder1"],
         "segformer3d": ["fuse", "stages.3.embed.proj"],
         "mednext":     ["dec_block_0", "bottleneck", "up_3"],
+        # AttentionUnet nests deeply; the last upsample before the head keeps a
+        # spatial grid and is the right CAM target.
+        "attentionunet": ["model.2", "model.1.submodule.2"],
     }
     named = dict(model.named_modules())
     for path in candidates.get(model_name, []):
